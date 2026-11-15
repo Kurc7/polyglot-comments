@@ -1,0 +1,4 @@
+# Артефакты сборки и запуска
+*.class
+comments_report.txt
+build/

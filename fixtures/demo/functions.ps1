@@ -1,0 +1,331 @@
+#Requires -Version 3.0
+<#
+scan_comments.ps1 ? ???????-?????? ???????????? ? ???????? ???? (PowerShell-?????? scan_comments.py).
+
+?????? ?? ????? ???????:
+    powershell -ExecutionPolicy Bypass -File scan_comments.ps1
+?????????: comments_report.txt ? ????? ??????? (????????????????), UTF-8 ??? BOM, ???????? ????? LF.
+?????? ??????????? ??????????? Windows PowerShell 5.1 / PowerShell 7+, ??????? ???????????? ???.
+#>
+
+$ErrorActionPreference = 'Stop'
+$ProgressPreference    = 'SilentlyContinue'
+try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch { }
+
+# ---------------------------------------------------------------------------
+# ?????????? ? ????? ?????????? (?? ??, ??? ? scan_comments.py)
+# ---------------------------------------------------------------------------
+
+# ?????, ??????? ?? ????????? (????????? ?? basename, ??? ????? ????????)
+$ExcludedDirs = @(
+    'target', 'build', 'out', '.git', '.idea', 'node_modules',
+    'test', 'tests', 'generated', 'gen',
+    'generated-sources', 'generated-test-sources'
+)
+
+# ?????: ?????????? (? ?????? ????????) -> ????? ????????????.
+#   c ? //  /* ... */  /** ... */;  hash ? #;  xml ? <!-- ... -->
+#   sql ? -- ? /* ... */;  lua ? -- ? --[[ ... ]];  bat ? REM ? ::
+$CommentSyntax = @{
+    '.java' = 'c'; '.js' = 'c'; '.jsx' = 'c'; '.ts' = 'c'; '.tsx' = 'c'
+    '.c' = 'c'; '.h' = 'c'; '.cpp' = 'c'; '.hpp' = 'c'; '.cc' = 'c'
+    '.cs' = 'c'; '.go' = 'c'; '.kt' = 'c'; '.kts' = 'c'; '.scala' = 'c'
+    '.php' = 'c'; '.swift' = 'c'; '.dart' = 'c'; '.rs' = 'c'
+    '.css' = 'c'; '.scss' = 'c'; '.less' = 'c'
+    '.groovy' = 'c'; '.gradle' = 'c'; '.proto' = 'c'
+    '.py' = 'hash'; '.rb' = 'hash'; '.sh' = 'hash'; '.bash' = 'hash'
+    '.zsh' = 'hash'; '.yaml' = 'hash'; '.yml' = 'hash'
+    '.properties' = 'hash'; '.conf' = 'hash'; '.toml' = 'hash'
+    '.ini' = 'hash'; '.r' = 'hash'; '.pl' = 'hash'; '.ps1' = 'hash'
+    '.dockerfile' = 'hash'; '.gitignore' = 'hash'; '.env' = 'hash'
+    '.tf' = 'hash'
+    '.xml' = 'xml'; '.html' = 'xml'; '.htm' = 'xml'; '.xhtml' = 'xml'
+    '.svg' = 'xml'; '.jsp' = 'xml'; '.ftl' = 'xml'; '.xsd' = 'xml'
+    '.wsdl' = 'xml'; '.pom' = 'xml'; '.vue' = 'xml'; '.svelte' = 'xml'
+    '.sql' = 'sql'
+    '.lua' = 'lua'
+    '.bat' = 'bat'; '.cmd' = 'bat'
+}
+
+# ????? ??? ??????????, ???????????? ?? ????? (? ?????? ????????)
+$FileNameSyntax = @{ 'dockerfile' = 'hash' }
+
+$ReportName  = 'comments_report.txt'
+$QuoteStyles = @('c', 'hash', 'xml', 'sql', 'lua')
+$LineTypes   = @('line', 'hash', 'sql', 'lua', 'bat')
+
+# ??????? UTF-8 (??????? ?????????? ?? ?????????? ??????) ? UTF-8 ??? BOM ??? ??????
+$Utf8Strict = New-Object System.Text.UTF8Encoding($false, $true)
+$Utf8NoBom  = New-Object System.Text.UTF8Encoding($false)
+
+# ---------------------------------------------------------------------------
+# ??????
+# ---------------------------------------------------------------------------
+
+function Get-Comments {
+    param(
+        [Parameter(Mandatory)][string]$Text,
+        [Parameter(Mandatory)][string]$Style
+    )
+
+    # ???????????? ?????? ? ?????? ???????????:
+    # 0 = CODE, 1 = IN_LINE_COMMENT, 2 = IN_BLOCK_COMMENT, 3 = IN_STRING/IN_CHAR.
+    # ? ??????? ? ?????????? ????????? ?????????? ???????????? ?? ?????????
+    # ?????????????; ????????????? ?\\ + ??????? ????????? \", \', \\, \\uXXXX.
+    # ????????? /* ... */ ?? ??????????????: ?????? */ ????????? ????.
+    $chars = $Text.ToCharArray()
+    $n = $chars.Length
+    $result = New-Object 'System.Collections.Generic.List[object]'
+
+    $isC = ($Style -eq 'c'); $isHash = ($Style -eq 'hash')
+    $isXml = ($Style -eq 'xml'); $isSql = ($Style -eq 'sql')
+    $isLua = ($Style -eq 'lua'); $isBat = ($Style -eq 'bat')
+    $hasQuotes = ($QuoteStyles -contains $Style)
+
+    # ????????? ???????? ??????????? ? ????????
+    $cStart = 0; $cLine = 0; $commentType = ''
+    $quote = [char]0       # ???????? ??????? (IN_STRING / IN_CHAR)
+    $longClose = ''        # ??????????? delimiter ??????? ?????/???????????? Lua
+
+    function Add-Cmt {
+        param([int]$End)
+        $raw = $Text.Substring($cStart, $End - $cStart)
+        if ($LineTypes -contains $commentType) { $raw = $raw.TrimEnd([char]13) }
+        $result.Add(@{ Line = $cLine; Type = $commentType; Text = $raw })
+    }
+
+    $i = 0; $line = 1; $state = 0; $atLineStart = $true
+
+    while ($i -lt $n) {
+        $ch = $chars[$i]
+
+        if ($state -eq 0) {
+            # ---- ????????? ? ?????????? ???????? (?????????? ?????? ? ?? ???????????) ----
+            if ($hasQuotes -and (($ch -eq '"') -or ($ch -eq "'"))) {
+                if ($isC -and $ch -eq "'") { $quote = [char]39 } else { $quote = $ch }
+                $longClose = ''
+                $state = 3
+                $i++
+                continue
+            }
+            # ??????? ?????? Lua: [[...]], [=[...]=]
+            if ($isLua -and $ch -eq '[') {
+                $j = $i + 1
+                while ($j -lt $n -and $chars[$j] -eq '=') { $j++ }
+                if ($j -lt $n -and $chars[$j] -eq '[') {
+                    $longClose = ']' + (New-Object System.String($chars, $i + 1, $j - $i - 1)) + ']'
+                    $state = 3
+                    $i = $j + 1
+                    continue
+                }
+            }
+
+            # ---- ??????????? (?? ?????) ----
+            if (($isC -or $isSql) -and $ch -eq '/' -and ($i + 1) -lt $n) {
+                if ($isC -and $chars[$i + 1] -eq '/') {
+                    $cStart = $i; $cLine = $line; $commentType = 'line'
+                    $state = 1; $i += 2; continue
+                }
+                if ($chars[$i + 1] -eq '*') {
+                    $cStart = $i; $cLine = $line
+                    # javadoc: /** ..., ?? ?? /***
+                    $isJd = (($i + 2) -lt $n -and $chars[$i + 2] -eq '*') -and
+                            (-not ((($i + 3) -lt $n) -and ($chars[$i + 3] -eq '*')))
+                    $commentType = if ($isJd) { 'javadoc' } else { 'block' }
+                    $state = 2; $i += 2; continue
+                }
+            }
+            elseif ($isHash -and $ch -eq '#') {
+                $cStart = $i; $cLine = $line; $commentType = 'hash'
+                $state = 1; $i++; continue
+            }
+            elseif ($isXml -and $ch -eq '<' -and $Text.StartsWith('<!--', $i)) {
+                $cStart = $i; $cLine = $line; $commentType = 'xml'
+                $state = 2; $i += 4; continue
+            }
+            elseif ($isSql -and $ch -eq '-' -and ($i + 1) -lt $n -and $chars[$i + 1] -eq '-') {
+                $cStart = $i; $cLine = $line; $commentType = 'sql'
+                $state = 1; $i += 2; continue
+            }
+            elseif ($isLua -and $ch -eq '-' -and ($i + 1) -lt $n -and $chars[$i + 1] -eq '-') {
+                $cStart = $i; $cLine = $line; $commentType = 'lua'
+                # ??????? ??????????? --[[...]] / --[=[...]=]
+                $j = $i + 2
+                if ($j -lt $n -and $chars[$j] -eq '[') {
+                    $k = $j + 1
+                    while ($k -lt $n -and $chars[$k] -eq '=') { $k++ }
+                    if ($k -lt $n -and $chars[$k] -eq '[') {
+                        $longClose = ']' + (New-Object System.String($chars, $j + 1, $k - $j - 1)) + ']'
+                        $state = 2
+                        $i = $k + 1
+                        continue
+                    }
+                }
+                $state = 1; $i += 2; continue
+            }
+            elseif ($isBat -and $atLineStart -and $ch -ne ' ' -and $ch -ne "`t") {
+                # bat: :: ? REM ? ?????? ? ?????? ??????; REM ? ??? ????????? ?????
+                if ($ch -eq ':' -and ($i + 1) -lt $n -and $chars[$i + 1] -eq ':') {
+                    $cStart = $i; $cLine = $line; $commentType = 'bat'
+                    $state = 1; $i += 2; continue
+                }
+                $rem3 = $Text.Substring($i, [Math]::Min(3, $n - $i)).ToUpper()
+                if (($rem3 -eq 'REM') -and ((($i + 3) -ge $n) -or ($chars[$i + 3] -in @(' ', "`t")))) {
+                    $cStart = $i; $cLine = $line; $commentType = 'bat'
+                    $state = 1; $i += 3; continue
+                }
+                $atLineStart = $false
+            }
+
+            # ---- ??????? ?????? ???? ----
+            if ($ch -eq "`n") {
+                $line++
+                $atLineStart = $true
+            }
+            elseif ($isBat -and $ch -ne ' ' -and $ch -ne "`t") {
+                $atLineStart = $false
+            }
+            $i++
+        }
+        elseif ($state -eq 1) {
+            # ???????????? ???????????: ?? ????? ?????? (??? ?????? \n)
+            if ($ch -eq "`n") {
+                Add-Cmt $i
+                $state = 0
+                $line++
+                $atLineStart = $true
+            }
+            $i++
+        }
+        elseif ($state -eq 2) {
+            if ($commentType -eq 'xml') {
+                # ??????????? -->
+                if ($Text.StartsWith('-->', $i)) {
+                    $i += 3; Add-Cmt $i; $state = 0
+                }
+                else { if ($ch -eq "`n") { $line++ }; $i++ }
+            }
+            elseif ($longClose) {
+                # ??????? ??????????? Lua --[[...]]
+                if ($Text.StartsWith($longClose, $i)) {
+                    $i += $longClose.Length; Add-Cmt $i; $state = 0
+                }
+                else { if ($ch -eq "`n") { $line++ }; $i++ }
+            }
+            else {
+                # /* ... */ (c ? sql): ?????? */ ????????? ????, ??????????? ???
+                if ($ch -eq '*' -and ($i + 1) -lt $n -and $chars[$i + 1] -eq '/') {
+                    $i += 2; Add-Cmt $i; $state = 0
+                }
+                else { if ($ch -eq "`n") { $line++ }; $i++ }
+            }
+        }
+        else {
+            # IN_STRING / IN_CHAR
+            if ($longClose) {
+                # ??????? ?????? Lua: ??? ?????????????, ?? ???????????? delimiter
+                if ($Text.StartsWith($longClose, $i)) {
+                    $i += $longClose.Length; $state = 0
+                }
+                else { if ($ch -eq "`n") { $line++ }; $i++ }
+            }
+            elseif ($ch -eq '\' -and $Style -ne 'xml' -and ($i + 1) -lt $n) {
+                # ?????????????: \", \', \\, \\uXXXX ? ?????????? ???? ?\\ + ???????
+                $i += 2
+            }
+            elseif ($ch -eq $quote) {
+                $i++; $state = 0
+            }
+            elseif ($ch -eq "`n") {
+                # ???????? ?????? ?? ??????????? (??????? ? ????????? ?????? ????)
+                $line++; $state = 0; $i++
+            }
+            else {
+                $i++
+            }
+        }
+    }
+
+    # ?????????? ??????????? ? ????? ????? ? ????? ?? ????? ??????
+    if ($state -eq 1 -or $state -eq 2) { Add-Cmt $n }
+    return $result
+}
+
+# ---------------------------------------------------------------------------
+# ?????? ?????? ? ????? ??????
+# ---------------------------------------------------------------------------
+
+function Read-SourceText {
+    param([string]$Path)
+    $bytes = [System.IO.File]::ReadAllBytes($Path)   # IOException -> ??? ?????????
+    if ($bytes.Length -gt 0) {
+        # ???????? ?????????: \x00 ? ?????? 8 ??
+        $headLen = [Math]::Min(8192, $bytes.Length)
+        $head = New-Object 'byte[]' $headLen
+        [Array]::Copy($bytes, $head, $headLen)
+        foreach ($b in $head) { if ($b -eq 0) { throw 'BINARY' } }
+    }
+    # ?????????: UTF-8 -> cp1251 -> latin-1
+    try {
+        return @{ Text = $Utf8Strict.GetString($bytes); Enc = 'utf-8' }
+    }
+    catch {
+        try {
+            return @{ Text = [System.Text.Encoding]::GetEncoding(1251).GetString($bytes); Enc = 'cp1251' }
+        }
+        catch {
+            return @{ Text = [System.Text.Encoding]::GetEncoding('ISO-8859-1').GetString($bytes); Enc = 'latin-1' }
+        }
+    }
+}
+
+function Get-SyntaxForFile {
+    param([string]$Name)
+    $dot = $Name.LastIndexOf('.')
+    if ($dot -ge 0) { $ext = $Name.Substring($dot).ToLower() } else { $ext = '' }
+    if (($ext -eq '') -and $Name.StartsWith('.')) { $ext = $Name.ToLower() }  # dot-?????: .gitignore, .env
+    if ($ext -ne '') {
+        $s = $CommentSyntax[$ext]
+        if ($null -ne $s) { return $s }
+    }
+    $fn = $FileNameSyntax[$Name.ToLower()]          # ???????? Dockerfile
+    if ($null -ne $fn) { return $fn }
+    return $null
+}
+
+function Get-SourceFiles {
+    param([string]$Dir)
+    # ????????/????????? ?? ?????????????? (?????? ?? ??????)
+    $subdirs = @(Get-ChildItem -LiteralPath $Dir -Directory -Force -ErrorAction SilentlyContinue |
+                 Where-Object { $_.LinkType -eq $null } | Sort-Object Name)
+    $files   = @(Get-ChildItem -LiteralPath $Dir -File -Force -ErrorAction SilentlyContinue |
+                 Where-Object { $_.LinkType -eq $null } | Sort-Object Name)
+    foreach ($f in $files) { $f.FullName }
+    foreach ($d in $subdirs) {
+        if ($ExcludedDirs -notcontains $d.Name.ToLower()) { Get-SourceFiles -Dir $d.FullName }
+    }
+}
+
+# ---------------------------------------------------------------------------
+# ?????????????? ??????
+# ---------------------------------------------------------------------------
+
+function Format-Comment {
+    param([int]$LineNo, [string]$Type, [string]$Raw)
+    # "L12   [line]" ? ????? ????? ? ?????? 4, ??????? ????????????? ?? 15 ????????;
+    # ??????????? ????????????? ???????????? ? ? ???????? 15 ????????
+    $lines = @($Raw -split "`n")
+    $out = New-Object 'System.Collections.Generic.List[string]'
+    for ($k = 0; $k -lt $lines.Count; $k++) {
+        $l = $lines[$k].TrimEnd([char]13)
+        if ($k -eq 0) {
+            $prefix = ('L{0,-4} [{1}]' -f $LineNo, $Type).PadRight(15)
+            $out.Add($prefix + ' ' + $l)
+        }
+        else {
+            $out.Add((' ' * 15) + $l)
+        }
+    }
+    return ($out -join "`n")
+}
+
