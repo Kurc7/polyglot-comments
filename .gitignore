@@ -2,3 +2,6 @@
 *.class
 comments_report.txt
 build/
+
+# Файлы для AI-агентов — не публикуются в репозитории
+AGENTS.md

@@ -9,7 +9,7 @@
 - Python 3 — для основной версии;
 - PowerShell 5.1+ (Windows) или pwsh (Linux/macOS);
 - JDK с `javac` в PATH — только для `run_scan_java.bat`;
-- JRE достаточно для запуска через JAR (`dist/scan-comments.jar`).
+- JRE 8+ достаточно для запуска через JAR (`dist/scan-comments.jar`).
 
 ## Запуск
 
@@ -41,7 +41,6 @@
 
 ```
 ├── README.md                 — это описание
-├── AGENTS.md                 — контекст для AI-агентов: инвариант, нюансы, проверка
 ├── src/
 │   ├── python/scan_comments.py      — реализация на Python (эталон)
 │   ├── powershell/scan_comments.ps1 — реализация на PowerShell
@@ -54,10 +53,28 @@
 ## Пересборка JAR (после правок `src/java`)
 
 ```sh
-javac -encoding UTF-8 -d /tmp/sc_classes src/java/ScanComments.java
+javac --release 8 -encoding UTF-8 -d /tmp/sc_classes src/java/ScanComments.java
 jar --create --file dist/scan-comments.jar --main-class ScanComments -C /tmp/sc_classes .
 ```
 
+`--release 8` — JAR запускается на любой Java начиная с 8.
+
 ## Проверка побайтового равенства
 
-Полный рецепт — в [AGENTS.md](AGENTS.md#проверка-инварианта).
+Скопируйте `fixtures/demo` в четыре временные папки, запустите в каждой по одной
+реализации (Python / PowerShell / Java-классы / JAR) и сравните хэши отчётов:
+
+```sh
+P=<путь к проекту>
+S=$LOCALAPPDATA/Temp/sc_check        # любая scratch-папка
+rm -rf "$S"/v1 "$S"/v2 "$S"/v3 "$S"/v4 "$S/jc"
+mkdir -p "$S/v1" "$S/v2" "$S/v3" "$S/v4" "$S/jc"
+for v in 1 2 3 4; do cp -r "$P/fixtures/demo/." "$S/v$v/"; done
+(cd "$S/v1" && python "$P/src/python/scan_comments.py")
+(cd "$S/v2" && powershell -NoProfile -ExecutionPolicy Bypass -File "$P/src/powershell/scan_comments.ps1")
+javac --release 8 -encoding UTF-8 -d "$S/jc" "$P/src/java/ScanComments.java"
+(cd "$S/v3" && java -cp "$S/jc" ScanComments)
+(cd "$S/v4" && java -jar "$P/dist/scan-comments.jar")
+sha256sum "$S"/v1/comments_report.txt "$S"/v2/comments_report.txt \
+          "$S"/v3/comments_report.txt "$S"/v4/comments_report.txt   # все 4 хэша должны совпасть
+```
